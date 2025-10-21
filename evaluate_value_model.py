@@ -8,6 +8,7 @@ import numpy as np
 from datasets import Dataset
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
+from vllm.lora.request import LoRARequest
 
 
 _BOXED_PATTERN = re.compile(r"\\boxed\s*\{([^}]*)\}")
@@ -70,6 +71,7 @@ def run_evaluation(
     batch_size: int,
     sample_path: Path,
     sample_count: int,
+    lora_adapter: Optional[str] = None
 ):
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     llm = LLM(
@@ -78,8 +80,13 @@ def run_evaluation(
         dtype=dtype,
         trust_remote_code=True,
         seed=seed,
+        enable_lora=True if lora_adapter else False
     )
     ds = Dataset.from_parquet(dataset_path)
+
+    lora_request = None
+    if lora_adapter:
+        lora_request = LoRARequest("adapter", 1, lora_adapter)
 
     sampling = SamplingParams(
         n=1,
@@ -116,7 +123,7 @@ def run_evaluation(
                 gt_value = None
             batch_targets.append(float(gt_value) if gt_value is not None else math.nan)
 
-        outputs = llm.generate(rendered_prompts, sampling)
+        outputs = llm.generate(rendered_prompts, sampling, lora_request=lora_request)
 
         for idx, out in enumerate(outputs):
             text = out.outputs[0].text
@@ -198,9 +205,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", default="bfloat16", choices=["auto", "float16", "bfloat16"], help="Model dtype.")
     parser.add_argument("--seed", type=int, default=1234, help="Random seed.")
     parser.add_argument("--batch-size", type=int, default=256, help="Number of prompts to evaluate per batch.")
+    parser.add_argument("--lora-adapter", type=str, default=None, help="Path to LoRA adapter weights to apply during evaluation.")
     parser.add_argument(
         "--sample-output",
-        default="/pscratch/sd/s/siddart2/gql_evals/td/aime_value_samples.txt",
+        default="/pscratch/sd/s/siddart2/gql_evals/td/aime_value_samples_2.txt",
         help="File to save example questions and responses.",
     )
     parser.add_argument("--sample-count", type=int, default=20, help="Number of examples to save in the sample output file.")
@@ -221,6 +229,7 @@ def main():
         batch_size=args.batch_size,
         sample_path=sample_path,
         sample_count=args.sample_count,
+        lora_adapter=args.lora_adapter
     )
 
 

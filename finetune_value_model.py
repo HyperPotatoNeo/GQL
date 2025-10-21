@@ -5,6 +5,8 @@ import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
+from copy import deepcopy
+import gc
 
 import numpy as np
 import torch
@@ -354,18 +356,36 @@ def train(args: argparse.Namespace) -> None:
         accelerator.wait_for_everyone()
 
         if accelerator.is_main_process:
-            unwrapped: ValueModel = accelerator.unwrap_model(value_model)  # type: ignore
-            backbone = unwrapped.backbone
-            if hasattr(backbone, "merge_and_unload"):
-                backbone = backbone.merge_and_unload()
-            epoch_dir = Path(args.output_model) / f"epoch_{epoch}"
-            epoch_dir.mkdir(parents=True, exist_ok=True)
-            backbone.save_pretrained(epoch_dir)
-            tokenizer.save_pretrained(epoch_dir)
-            torch.save(unwrapped.value_head.state_dict(), epoch_dir / "value_head.pt")
-            head_config = {"hidden_size": backbone.config.hidden_size, "loss_type": args.loss_type}
-            with open(epoch_dir / "value_head_config.json", "w", encoding="utf-8") as f:
-                json.dump(head_config, f, indent=2)
+            with torch.inference_mode():
+                unwrapped: ValueModel = accelerator.unwrap_model(value_model)
+
+                epoch_dir = Path(args.output_model) / f"epoch_{epoch}"
+                epoch_dir.mkdir(parents=True, exist_ok=True)
+
+                # --- build a CPU-only copy, merge, save ---
+                save_copy = deepcopy(unwrapped.backbone).to("cpu")
+                if hasattr(save_copy, "merge_and_unload"):
+                    save_copy = save_copy.merge_and_unload()
+
+                # Avoid huge single-file writes; safetensors + sharding is lighter
+                save_copy.save_pretrained(
+                    epoch_dir,
+                    safe_serialization=True,          # uses safetensors if available
+                    max_shard_size="2GB",             # optional: reduce peak RAM
+                )
+                tokenizer.save_pretrained(epoch_dir)
+
+                # save value head on CPU
+                vh_state = {k: v.cpu() for k, v in unwrapped.value_head.state_dict().items()}
+                torch.save(vh_state, epoch_dir / "value_head.pt")
+                with open(epoch_dir / "value_head_config.json", "w") as f:
+                    json.dump({"hidden_size": save_copy.config.hidden_size, "loss_type": args.loss_type}, f, indent=2)
+
+                # --- free CPU RAM aggressively ---
+                del vh_state
+                del save_copy
+                gc.collect()
+        accelerator.wait_for_everyone()
 
     accelerator.wait_for_everyone()
 
